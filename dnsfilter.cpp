@@ -27,6 +27,20 @@
 #include <cassert>
 #include <assert.h>
 
+#include <boost/program_options.hpp>
+#include <boost/tokenizer.hpp>
+
+namespace bpo = boost::program_options;
+
+namespace TEXT {
+	const std::string Red("\033[0;31m");
+	const std::string Green("\033[1;32m");
+	const std::string Yellow("\033[1;33m");
+	const std::string Cyan("\033[0;36m");
+	const std::string Magenta("\033[0;35m");
+	const std::string Reset("\033[0m");
+};
+
 #define BUFSIZE 65536
 
 void die(const char * msg)
@@ -510,6 +524,13 @@ namespace DNS
 			}
 		}
 
+		if (ans.r_type == Type::AAAA) {
+			if (ans.r_data.size() == 16) {
+				char addr[INET6_ADDRSTRLEN];
+    			inet_ntop(AF_INET6, (void *)ans.r_data.data(), addr, INET6_ADDRSTRLEN);
+				return addr;
+			}
+		}
 		return std::string("???");
 	}
 }
@@ -530,8 +551,9 @@ struct DnsServer
 		uint16_t listen_port;
 		std::string forward_address;
 		std::chrono::duration<uint32_t> ttl;
-
 		std::string bind;
+
+		std::map<std::string, std::pair<bool, bool>> per_host_configs;	// <somehost.com <ipv4 ipv6>>
 	};
 
 
@@ -672,7 +694,29 @@ bool DnsServer::filter_out(uint16_t r_type) const
 
 bool DnsServer::filter_out(const DNS::Answer& answer) const
 {
-	return filter_out(answer.r_type);
+	if (filter_out(answer.r_type)) {
+		return true;
+	}
+
+	// Per host filter here
+	auto nm = DNS::build_name(answer.r_name, 0);
+	for (const auto &phc : settings_.per_host_configs) {
+		if (nm.find(phc.first) != std::string::npos) {
+			if (answer.r_type == DNS::Type::AAAA && phc.second.first) {
+				std::cout << TEXT::Red << "F: " << nm << " -- remove ipv6" << TEXT::Reset << "\n";
+				return true;	// Filter ipv6
+			}
+
+			if (answer.r_type == DNS::Type::A && phc.second.second) {
+				std::cout << TEXT::Red << "F: " << nm << " -- remove ipv4" << TEXT::Reset << "\n";
+				return true;	// Filter ipv4
+			}
+
+			return false;			
+		}
+	}
+
+	return false;
 }
 
 bool DnsServer::filter_addresses(std::vector<DNS::Answer>& answers) const
@@ -861,13 +905,15 @@ void DnsServer::send_reply(const DNS::Packet& packet, const Address& client_addr
 	assert(DNS::parse(buf.data(), buf.size(), pkt));
 
 	for (auto& i : packet.answer) {
-		if (i.r_type == DNS::Type::A)
-			std::cout << "R: " << DNS::build_name(i.r_name, 0) << "[" << i.r_class << "]" << " -> " << DNS::get_address(i) << '\n';
+		if (i.r_type == DNS::Type::A || i.r_type == DNS::Type::AAAA) {
+			std::cout << TEXT::Green << "R: " << DNS::build_name(i.r_name, 0) << "[" << i.r_type << "]" << " -> " << DNS::get_address(i) << TEXT::Reset << '\n';
+		}
 	}
 
 	for (auto& i : packet.authority) {
-		if (i.r_type == DNS::Type::A)
-			std::cout << "R: " << DNS::build_name(i.r_name, 0) << "[" << i.r_class << "]" << " -> " << DNS::get_address(i) << '\n';
+		if (i.r_type == DNS::Type::A || i.r_type == DNS::Type::AAAA) {
+			std::cout << TEXT::Cyan << "R: " << DNS::build_name(i.r_name, 0) << "[" << i.r_type << "]" << " -> " << DNS::get_address(i) << TEXT::Reset << '\n';
+		}
 	}
 
 	ssize_t n = sendto(sockfd_, buf.data(), buf.size(), 0, client_addr);
@@ -1073,48 +1119,85 @@ DnsServer::run()
 	}
 }
 
-#include <getopt.h>
-
-bool string_to_bool(const char * str, bool def_value)
-{
-	if (!str || !*str)
-		return def_value;
-
-	if (strcasecmp(str, "0") == 0
-	|| strcasecmp(str, "no") == 0
-	|| strcasecmp(str, "disable") == 0
-	|| strcasecmp(str, "false") == 0)
-		return false;
-	return true;
-}
-
 int
 main(int argc, char ** argv)
 {
-	enum {
-		Option_IPV4 = 256,
-		Option_IPV6,
-		Option_Bind,
-	};
-
-	static const struct option options[] = {
-		{ "listen", required_argument, nullptr, 'l' },
-		{ "forward", required_argument, nullptr, 'f' },
-		{ "hosts", required_argument, nullptr, 'h' },
-		{ "ipv4", optional_argument, nullptr, Option_IPV4 },
-		{ "ipv6", optional_argument, nullptr, Option_IPV6 },
-		{ "bind", required_argument, nullptr, Option_Bind },
-		{}
-	};
-
-	int opt;
-
 	DnsServer::Settings settings;
 
-	settings.listen_port = 53;
-	settings.forward_address = std::string();
-	settings.ipv4 = true;
-	settings.ipv6 = true;
+    bpo::options_description opts;
+         opts.add_options()
+         ("help,h", "Print this help message and exit.")
+         ("listen,l", bpo::value<int>()->default_value(53), "Listen on port, default 53")
+         ("forward,f", bpo::value<std::string>(), "Forward to nameserver, default 8.8.8.8")
+         ("ipv4", bpo::value<bool>()->default_value(true), "enable/disable ipv4, default enable")
+		 ("ipv6", bpo::value<bool>()->default_value(true), "enable/disable ipv6, default enable")
+         ("bind,b", bpo::value<std::string>(), "Bind server to addr, default to all")
+		 ("host", bpo::value<std::string>(), "Load extra host file")
+         ("pdc,p", bpo::value<std::vector<std::string>>()->multitoken(), 
+		 	"Per domain config, support multi domain, (example: hostname.com#4 test.com#6 )");
+
+    bpo::variables_map options;
+    bpo::store( bpo::parse_command_line(argc, argv, opts), options );
+	bpo::notify(options);
+
+    if( options.count("help") )
+    {
+        std::cout << opts << "\n";
+        return 0;
+    }
+
+	if ( options.count("listen") )
+	{
+		settings.listen_port = options["listen"].as<int>(); 
+	}
+
+	if ( options.count("ipv4") ) 
+	{
+		settings.ipv4 = options["ipv4"].as<bool>();
+	}
+
+	if ( options.count("ipv6") ) 
+	{
+		settings.ipv6 = options["ipv6"].as<bool>();
+	}
+
+	if ( options.count("forward") )
+	{
+		settings.forward_address = options["forward"].as<std::string>();
+	} else {
+		settings.forward_address = "8.8.8.8";
+	}
+
+	if ( options.count("bind") )
+	{
+		settings.bind = options["bind"].as<std::string>();
+	}
+
+	if ( options.count("pdc") )
+	{
+		typedef boost::tokenizer<boost::char_separator<char>> tokenizer;
+
+		std::vector<std::string> pdcs = options["pdc"].as<std::vector<std::string>>();
+		boost::char_separator<char> sep{"#", ":"};
+
+		for (auto &hc : pdcs) {
+			tokenizer tok{hc, sep};
+			std::vector<std::string> tmp;
+			for (auto &tkx : tok) {
+				tmp.push_back(tkx);
+			}
+
+			if (tmp.size() != 2 || (tmp[1] != "4" && tmp[1] != "6")) {
+				std::cout << opts << "\n";
+				return -1;
+			}
+
+			auto ipvx = std::make_pair(tmp[1] == "4", tmp[1] == "6");
+			settings.per_host_configs[tmp[0]] = ipvx;
+			//std::cout << "DEBUG: " << tmp[0] << " : " << tmp[1] << "\n";
+		}
+	}
+
 	settings.ttl = std::chrono::minutes(10);
 
 	std::string hosts = std::string();
@@ -1122,31 +1205,16 @@ main(int argc, char ** argv)
 	setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
 	setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
 
-	while( (opt = getopt_long(argc, argv, "l:f:h:", options, nullptr)) != -1) {
-		switch (opt)
-		{
-		case 'l': settings.listen_port = std::stoul(optarg); break;
-		case 'f': settings.forward_address = optarg; break;
-		case 'h': hosts = optarg; break;
-
-		case Option_IPV4: settings.ipv4 = string_to_bool(optarg, true); break;
-		case Option_IPV6: settings.ipv6 = string_to_bool(optarg, true); break;
-		case Option_Bind: settings.bind = optarg; break;
-
-		case ':':
-			std::cerr << "Missing argument";
-			exit(EXIT_FAILURE);
-
-		case '?':
-			std::cerr << "Unknown option";
-			exit(EXIT_FAILURE);
-		}
-	}
-
 	DnsServer dns_server(settings);
 
-	if (!hosts.empty() && !dns_server.load_hosts(hosts))
-		exit(EXIT_FAILURE);
+	if ( options.count("host") ) 
+	{
+		std::string hosts = options["host"].as<std::string>();
+		if (!hosts.empty() && !dns_server.load_hosts(hosts))
+		{
+			exit(EXIT_FAILURE);		
+		}
+	}
 
 	dns_server.run();
 	return 0;
