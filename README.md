@@ -10,8 +10,10 @@ Fork from osesov/dnsfilter
 new features:
 - add per domain ipv4/ipv6 filter, for example:
 
-    $ sudo dnsfilter --pdc google.com#4 youtube.com#6 google.de#6
-    (google.com#4 meaning only ipv4 will return when query google.com etc.)
+    ```s
+    $ sudo dnsfilter --pdc google.com:4 youtube.com:6 google.de:6
+    ```
+    _(google.com:4 meaning only ipv4 will return when query google.com etc.)_
 
 - More debug information like ipv6 addr, colorful output.
 
